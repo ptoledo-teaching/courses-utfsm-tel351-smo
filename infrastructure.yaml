@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: TEL351 - HoloNet operational report service
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ReaderLogGroup:
+    Type: AWS::Logs::LogGroup
+
+  ReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ServiceLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ReaderLogGroup.Arn
+        - PolicyName: ReportStorage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${DataBucket.Arn}/*'
+
+  ReaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: HoloNet report reader
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt ReaderRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      LoggingConfig:
+        LogGroup: !Ref ReaderLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          OPERATIONAL_KEY: operation/report.json
+          RESTRICTED_KEY: restricted/report.json
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client("s3")
+
+          def response(status, payload):
+              return {"statusCode": status, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": json.dumps(payload)}
+
+          def handler(event, context):
+              path = event.get("rawPath", "")
+              method = event.get("requestContext", {}).get("http", {}).get("method", "")
+              keys = {"/reports/operational": "OPERATIONAL_KEY", "/reports/restricted": "RESTRICTED_KEY"}
+              if method != "GET" or path not in keys:
+                  return response(404, {"error": "NOT_FOUND", "requestId": context.aws_request_id})
+              key = os.environ[keys[path]]
+              record = {"event": "storage_access", "requestId": context.aws_request_id, "operation": "GetObject", "objectKey": key}
+              try:
+                  obj = s3.get_object(Bucket=os.environ["DATA_BUCKET"], Key=key)
+                  with obj["Body"] as stream:
+                      report = json.loads(stream.read())
+              except ClientError as error:
+                  code = error.response.get("Error", {}).get("Code", "Unknown")
+                  denied = code in ("AccessDenied", "403")
+                  print(json.dumps({**record, "outcome": "DENIED" if denied else "ERROR", "awsErrorCode": code}), flush=True)
+                  return response(403 if denied else 502, {"error": "ACCESS_DENIED" if denied else "STORAGE_ERROR", "requestId": context.aws_request_id})
+              print(json.dumps({**record, "outcome": "ALLOWED"}), flush=True)
+              return response(200, {"report": report, "requestId": context.aws_request_id})
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: tel351-smo
+      ProtocolType: HTTP
+      Target: !GetAtt ReaderFunction.Arn
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ReaderFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  SeedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  SeedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InitialReports
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub '${DataBucket.Arn}/operational/report.json'
+                  - !Sub '${DataBucket.Arn}/restricted/report.json'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt SeedLogGroup.Arn
+
+  SeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Initializes the laboratory reports
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt SeedRole.Arn
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref SeedLogGroup
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+
+          REPORTS = {
+              "operational/report.json": {"station": "coruscant-01", "classification": "operational", "linkStatus": "ONLINE", "message": "HoloNet relay operating within normal parameters."},
+              "restricted/report.json": {"station": "coruscant-01", "classification": "restricted", "message": "Restricted coordination report. Not available through the operational service."},
+          }
+
+          def handler(event, context):
+              status, reason = "SUCCESS", "Report initialization completed."
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      s3 = boto3.client("s3")
+                      for key, value in REPORTS.items():
+                          s3.put_object(Bucket=event["ResourceProperties"]["Bucket"], Key=key, Body=json.dumps(value).encode(), ContentType="application/json")
+              except Exception:
+                  status, reason = "FAILED", "Report initialization failed. Review the initialization function permissions and bucket."
+              payload = {"Status": status, "Reason": reason, "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name), "StackId": event["StackId"], "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"]}
+              request = urllib.request.Request(event["ResponseURL"], data=json.dumps(payload).encode(), method="PUT", headers={"Content-Type": ""})
+              with urllib.request.urlopen(request, timeout=10) as result:
+                  result.read()
+
+  InitialReports:
+    Type: Custom::InitialReports
+    Properties:
+      ServiceToken: !GetAtt SeedFunction.Arn
+      ServiceTimeout: 120
+      Bucket: !Ref DataBucket
+
+Outputs:
+  OperationalUrl:
+    Description: Operational report endpoint
+    Value: !Sub '${HttpApi.ApiEndpoint}/reports/operational'
+  RestrictedUrl:
+    Description: Restricted report endpoint
+    Value: !Sub '${HttpApi.ApiEndpoint}/reports/restricted'
+  ReaderFunctionName:
+    Description: Report reader function
+    Value: !Ref ReaderFunction
+  ReaderRoleName:
+    Description: Report reader execution role
+    Value: !Ref ReaderRole
+  DataBucketName:
+    Description: Report storage bucket
+    Value: !Ref DataBucket
+  LogGroupName:
+    Description: Report reader log group
+    Value: !Ref ReaderLogGroup
